@@ -1,0 +1,29 @@
+# --- 机密配置（绝不入库）---
+.env
+*.local.json
+appsettings.json
+secrets.json
+
+# --- .NET 构建产物 ---
+bin/
+obj/
+out/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+
+# --- 前端构建产物（npm run build 单向输出，不入库）---
+src/ResearchAssistant.Web/wwwroot/
+
+# --- Harness 默认文件记忆目录 ---
+agent-file-memory/
+
+# --- IDE ---
+.vs/
+.vscode/
+.idea/
+
+# --- 系统 ---
+Thumbs.db
+.DS_Store

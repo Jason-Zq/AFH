@@ -1,0 +1,11 @@
+{
+  "ConnectionStrings": {
+    "ResearchDb": "Host=localhost;Port=5432;Database=research_assistant;Username=postgres;Password=你的PG密码"
+  },
+  "DeepSeek": {
+    "ApiKey": "你的_deepseek_key"
+  },
+  "Bocha": {
+    "ApiKey": "你的_博查_key"
+  }
+}
