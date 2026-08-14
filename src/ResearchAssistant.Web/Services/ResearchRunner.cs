@@ -13,16 +13,39 @@ namespace ResearchAssistant.Web.Services;
 /// 以异步事件流的形式把工作流事件交给调用方（SSE 控制器）。
 /// 注册为单例：语料索引与 HTTP 客户端在进程内复用；DB 访问通过作用域获取 DbContext。
 /// </summary>
-public sealed class ResearchRunner(IWebHostEnvironment environment, IConfiguration configuration, IServiceScopeFactory scopeFactory) : IDisposable
+public sealed class ResearchRunner(IWebHostEnvironment environment, IConfiguration configuration, IServiceScopeFactory scopeFactory, ILogger<ResearchRunner> logger) : IDisposable
 {
     private readonly IWebHostEnvironment _environment = environment;
     private readonly IConfiguration _configuration = configuration;
     private readonly IServiceScopeFactory _scopeFactory = scopeFactory;
+    private readonly ILogger<ResearchRunner> _logger = logger;
     private readonly HttpClient _httpClient = new();
+    private readonly SemaphoreSlim _rebuildLock = new(1, 1);
 
     private IChatClient? _chatClient;
     private LocalCorpusSearch? _corpus;
     private IWebSearchProvider? _webSearch;
+    private int _runningCount;
+
+    /// <summary>是否有研究工作流正在运行（危险运维操作的闸门，如种子 replace 重导）。</summary>
+    public bool IsRunning => Volatile.Read(ref _runningCount) > 0;
+
+    /// <summary>从数据库重建语料索引并原子替换；进行中的研究持旧索引不受影响。返回新索引块数。</summary>
+    public async Task<int> RebuildCorpusAsync()
+    {
+        await _rebuildLock.WaitAsync();  // 手动重建与语料写操作触发的自动重建可能撞车，串行化
+        try
+        {
+            // 索引构建是同步 CPU + IO，包 Task.Run 让出调用线程
+            var corpus = await Task.Run(LoadCorpusFromDatabase);
+            Volatile.Write(ref _corpus, corpus);  // 引用赋值本身原子，Volatile 保证跨线程可见性
+            return corpus.ChunkCount;
+        }
+        finally
+        {
+            _rebuildLock.Release();
+        }
+    }
 
     /// <summary>本地语料块数（用于页面展示）。未就绪或异常时返回 0。</summary>
     public int CorpusChunkCount
@@ -39,40 +62,57 @@ public sealed class ResearchRunner(IWebHostEnvironment environment, IConfigurati
         string question, HarnessFeatureSwitches switches, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         EnsureInitialized();
-
-        var workflow = ResearchWorkflowFactory.Build(_chatClient!, _corpus!, _webSearch!, switches);
-        var run = await InProcessExecution.RunStreamingAsync(workflow, question, cancellationToken: cancellationToken);
+        Interlocked.Increment(ref _runningCount);
+        _logger.LogInformation("研究开始：{Question}", question);
 
         string? report = null;
-        var status = "Completed";
-        // yield 不能与 catch 同层（CS1626），故手动迭代：内层 try/catch 定状态，外层 yield
-        var enumerator = run.WatchStreamAsync(cancellationToken).GetAsyncEnumerator(cancellationToken);
+        var status = "Failed";  // 默认失败；流建立成功才改 Completed，取消由内层 catch 改写
+        // 自增之后的一切都必须在外层 finally 视野内——Build/启动流抛错（如客户端恰好此时断开）
+        // 若漏掉 Decrement，_runningCount 泄漏会让 IsRunning 永远为真（replace 重导永久 409）
         try
         {
-            while (true)
+            var workflow = ResearchWorkflowFactory.Build(_chatClient!, _corpus!, _webSearch!, switches);
+            await using var run = await InProcessExecution.RunStreamingAsync(workflow, question, cancellationToken: cancellationToken);
+            // yield 不能与 catch 同层（CS1626），故手动迭代：内层 try/catch 定状态，外层 yield
+            var enumerator = run.WatchStreamAsync(cancellationToken).GetAsyncEnumerator(cancellationToken);
+            status = "Completed";
+            try
             {
-                WorkflowEvent? evt;
-                try
+                while (true)
                 {
-                    evt = await enumerator.MoveNextAsync() ? enumerator.Current : null;
+                    WorkflowEvent? evt;
+                    try
+                    {
+                        evt = await enumerator.MoveNextAsync() ? enumerator.Current : null;
+                    }
+                    catch (OperationCanceledException) { status = "Cancelled"; throw; }
+                    catch { status = "Failed"; throw; }
+                    if (evt is null)
+                    {
+                        break;
+                    }
+                    if (evt is WorkflowOutputEvent output)
+                    {
+                        report = output.As<ChatMessage>()?.Text;
+                    }
+                    yield return evt;
                 }
-                catch (OperationCanceledException) { status = "Cancelled"; throw; }
-                catch { status = "Failed"; throw; }
-                if (evt is null)
-                {
-                    break;
-                }
-                if (evt is WorkflowOutputEvent output)
-                {
-                    report = output.As<ChatMessage>()?.Text;
-                }
-                yield return evt;
+            }
+            finally
+            {
+                await enumerator.DisposeAsync();
             }
         }
         finally
         {
-            await enumerator.DisposeAsync();
-            await run.DisposeAsync();
+            Interlocked.Decrement(ref _runningCount);
+            // 客户端断开时，MAF 的监听流可能"安静结束"（MoveNextAsync 返回 false）而不是抛
+            // OperationCanceledException——不校正的话，被用户取消的研究会记成 Completed
+            if (status == "Completed" && cancellationToken.IsCancellationRequested)
+            {
+                status = "Cancelled";
+            }
+            _logger.LogInformation("研究结束（{Status}）：{Question}", status, question);
             await SaveSessionAsync(question, switches, report, status);
         }
     }
@@ -84,17 +124,31 @@ public sealed class ResearchRunner(IWebHostEnvironment environment, IConfigurati
         {
             return;
         }
-        // 密钥两级回退：配置文件（appsettings.Local.json）→ 环境变量；都缺则报友好错误
-        var deepSeekKey = _configuration["DeepSeek:ApiKey"]
-            ?? Environment.GetEnvironmentVariable("DEEPSEEK_API_KEY")
-            ?? throw new InvalidOperationException("未找到 DeepSeek API key：请在 appsettings.Local.json 配置 DeepSeek:ApiKey，或设置环境变量 DEEPSEEK_API_KEY。");
-        var bochaKey = _configuration["Bocha:ApiKey"]
-            ?? Environment.GetEnvironmentVariable("BOCHA_API_KEY")
-            ?? throw new InvalidOperationException("未找到博查 API key：请在 appsettings.Local.json 配置 Bocha:ApiKey，或设置环境变量 BOCHA_API_KEY。");
+        // 与 RebuildCorpusAsync 共用同一把锁、锁内加载：否则"初启加载语料 v1"可能覆盖掉
+        // 管理端刚刚重建发布的 v2（竞态窗口虽窄，但错了就要到下次写操作才自愈）
+        _rebuildLock.Wait();
+        try
+        {
+            if (_chatClient is not null)
+            {
+                return;  // 等锁期间其他线程已完成初始化
+            }
+            // 密钥两级回退：配置文件（appsettings.Local.json）→ 环境变量；都缺则报友好错误
+            var deepSeekKey = _configuration["DeepSeek:ApiKey"]
+                ?? Environment.GetEnvironmentVariable("DEEPSEEK_API_KEY")
+                ?? throw new InvalidOperationException("未找到 DeepSeek API key：请在 appsettings.Local.json 配置 DeepSeek:ApiKey，或设置环境变量 DEEPSEEK_API_KEY。");
+            var bochaKey = _configuration["Bocha:ApiKey"]
+                ?? Environment.GetEnvironmentVariable("BOCHA_API_KEY")
+                ?? throw new InvalidOperationException("未找到博查 API key：请在 appsettings.Local.json 配置 Bocha:ApiKey，或设置环境变量 BOCHA_API_KEY。");
 
-        _chatClient = DeepSeekClientFactory.Create(apiKey: deepSeekKey);
-        _corpus = LoadCorpusFromDatabase();
-        _webSearch = new BochaWebSearchProvider(_httpClient, bochaKey);
+            _chatClient = DeepSeekClientFactory.Create(apiKey: deepSeekKey);
+            _corpus = LoadCorpusFromDatabase();
+            _webSearch = new BochaWebSearchProvider(_httpClient, bochaKey);
+        }
+        finally
+        {
+            _rebuildLock.Release();
+        }
     }
 
     /// <summary>从 PostgreSQL 读取语料建索引（documents 表由启动时的种子导入填充）。</summary>
@@ -126,9 +180,10 @@ public sealed class ResearchRunner(IWebHostEnvironment environment, IConfigurati
             });
             await db.SaveChangesAsync();
         }
-        catch
+        catch (Exception ex)
         {
-            // 落库失败不影响主流程（会话历史是附加能力），仅吞掉——正式产品应记日志
+            // 落库失败不影响主流程（会话历史是附加能力），记警告日志即可
+            _logger.LogWarning(ex, "研究会话落库失败");
         }
     }
 

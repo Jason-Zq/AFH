@@ -19,6 +19,11 @@ builder.Services.AddDbContext<ResearchDbContext>(options =>
 // 研究工作流运行器（单例：语料索引与 HTTP 客户端进程内复用；DB 访问走作用域）
 builder.Services.AddSingleton<ResearchRunner>();
 
+// 内存日志环形缓冲（后台管理"日志查看"数据源；重启即清，仅限本地演示）
+builder.Services.AddSingleton<InMemoryLogStore>();
+builder.Logging.Services.AddSingleton<ILoggerProvider, InMemoryLoggerProvider>();
+builder.Logging.AddFilter<InMemoryLoggerProvider>(null, LogLevel.Information);
+
 var app = builder.Build();
 
 // 启动即迁移建表 + 语料种子导入（幂等：表已存在/已有数据则跳过）
